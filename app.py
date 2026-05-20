@@ -1,350 +1,308 @@
-
 import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import bcrypt
-import datetime
-import json
-import os
+from database import init_db, register_user, login_user, simpan_riwayat, ambil_riwayat
+from styles import LUMACTA_CSS
 
-st.set_page_config(page_title="Life Nova", page_icon="🌸", layout="wide")
+# ── Konfigurasi halaman ──────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Lumacta",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-st.markdown("""
-<style>
-    .main-header {
-        background: linear-gradient(135deg, #FFB7B2 0%, #B5E3D5 100%);
-        padding: 2rem;
-        border-radius: 20px;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #FFD1CD 0%, #D4F0E8 100%);
-        padding: 1rem;
-        border-radius: 15px;
-        text-align: center;
-    }
-    .stButton > button {
-        background: linear-gradient(135deg, #FFB7B2 0%, #B5E3D5 100%);
-        border: none;
-        border-radius: 25px;
-    }
-</style>
-""", unsafe_allow_html=True)
+# ── Inisialisasi database ─────────────────────────────────────────────────────
+init_db()
 
-USERS_FILE = 'users.json'
+# ── Inject CSS ────────────────────────────────────────────────────────────────
+st.markdown(LUMACTA_CSS, unsafe_allow_html=True)
 
-def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'r') as file:
-            return json.load(file)
-    return {}
+# ── Session state defaults ────────────────────────────────────────────────────
+if "user" not in st.session_state:
+    st.session_state.user = None          # None = belum login
+if "halaman_auth" not in st.session_state:
+    st.session_state.halaman_auth = "login"  # "login" atau "register"
 
-def save_users(users):
-    with open(USERS_FILE, 'w') as file:
-        json.dump(users, file)
 
-def verify_password(password, hashed):
-    return bcrypt.checkpw(password.encode(), hashed)
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER UI
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def login_user(email, password):
-    users = load_users()
-    if email in users and verify_password(password, users[email]['password_hash']):
-        users[email]['last_login'] = str(datetime.datetime.now())
-        save_users(users)
-        return True
-    return False
-
-def register_user(email, password, name):
-    users = load_users()
-    if email in users:
-        return False, "Email sudah terdaftar!"
-    users[email] = {
-        'password_hash': bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
-        'name': name,
-        'created_at': str(datetime.date.today()),
-        'last_login': '',
-        'status': 'active'
-    }
-    save_users(users)
-    return True, "Registrasi berhasil! Silakan login."
-
-def reset_password(email, new_password):
-    users = load_users()
-    if email in users:
-        users[email]['password_hash'] = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-        save_users(users)
-        return True, "Password berhasil direset!"
-    return False, "Email tidak ditemukan!"
-
-def get_all_users():
-    return load_users()
-
-def is_admin(email):
-    return email == "admin@lifenova.com"
-
-@st.cache_data
-def generate_mortality_table():
-    ages = list(range(101))
-    lx = [100000]
-    for x in range(1, 101):
-        mu = 0.0001 * np.exp(0.08 * (x - 1))
-        lx.append(int(lx[-1] * np.exp(-mu)))
-    df = pd.DataFrame({'usia': ages, 'lx': lx})
-    df['dx'] = df['lx'].diff().fillna(0).abs().astype(int)
-    df['qx'] = (df['dx'] / df['lx']).fillna(0).round(6)
-    return df
-
-MORTALITY_TABLE = generate_mortality_table()
-
-def get_qx(usia):
-    return MORTALITY_TABLE[MORTALITY_TABLE['usia'] == usia]['qx'].values[0] if usia <= 100 else 1
-
-def get_npx(usia, n):
-    if usia + n > 100:
-        return 0
-    prob = 1
-    for t in range(n):
-        prob *= (1 - get_qx(usia + t))
-    return prob
-
-def get_tpx_qx_t(usia, t):
-    if usia + t + 1 > 100:
-        return 0
-    return get_npx(usia, t) * get_qx(usia + t)
-
-def calculate_whole_life(usia, bunga, benefit):
-    premium = 0
-    v = 1 / (1 + bunga)
-    for t in range(100 - usia):
-        premium += (v ** (t + 1)) * get_tpx_qx_t(usia, t)
-    return round(premium * benefit, 0)
-
-def calculate_term_life(usia, bunga, term, benefit):
-    premium = 0
-    v = 1 / (1 + bunga)
-    for t in range(term):
-        premium += (v ** (t + 1)) * get_tpx_qx_t(usia, t)
-    return round(premium * benefit, 0)
-
-def calculate_endowment(usia, bunga, term, benefit):
-    term_premium = calculate_term_life(usia, bunga, term, benefit)
-    survival = get_npx(usia, term) * (1 / (1 + bunga)) ** term * benefit
-    return round(term_premium + survival, 0)
-
-def calculate_annuity(usia, bunga, term, is_lifetime, payment):
-    annuity = 1
-    v = 1 / (1 + bunga)
-    max_term = (100 - usia - 1) if is_lifetime else min(term - 1, 100 - usia - 1)
-    for t in range(1, max_term + 1):
-        annuity += (v ** t) * get_npx(usia, t)
-    return round(annuity * payment, 0)
-
-def calculate_pension(usia, usia_pensiun, gaji, iuran, return_inv):
-    tahun = usia_pensiun - usia
-    if tahun <= 0:
-        return 0
-    iuran_bulanan = gaji * (iuran / 100)
-    bunga_bulanan = (1 + return_inv) ** (1/12) - 1
-    dana = 0
-    for _ in range(tahun * 12):
-        dana = dana * (1 + bunga_bulanan) + iuran_bulanan
-    return int(dana)
-
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user_email = None
-
-if not st.session_state.logged_in:
-    st.markdown("""
-    <div class="main-header">
-        <h1>🌸 Life Nova</h1>
-        <p>Aplikasi Aktuaria | Login dengan Email</p>
+def navbar():
+    user = st.session_state.user
+    st.markdown(f"""
+    <div class="lumacta-nav">
+        <div class="brand">🌿 Lumacta</div>
+        <div class="user-info">Halo, <strong>{user['nama']}</strong> &nbsp;·&nbsp; {user['email']}</div>
     </div>
     """, unsafe_allow_html=True)
-    
-    tab1, tab2, tab3 = st.tabs(["🔐 Login", "📝 Registrasi", "🔄 Lupa Password"])
-    
-    with tab1:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            email = st.text_input("Email", placeholder="contoh@email.com")
-            password = st.text_input("Password", type="password")
-            if st.button("🌸 Login", use_container_width=True):
-                if login_user(email, password):
-                    st.session_state.logged_in = True
-                    st.session_state.user_email = email
+
+
+def alert_sukses(pesan: str):
+    st.markdown(f'<div class="alert-success">✓ &nbsp;{pesan}</div>', unsafe_allow_html=True)
+
+
+def alert_error(pesan: str):
+    st.markdown(f'<div class="alert-error">✕ &nbsp;{pesan}</div>', unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HALAMAN LOGIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def halaman_login():
+    # Logo & judul tengah
+    col_l, col_c, col_r = st.columns([1, 1.2, 1])
+    with col_c:
+        st.markdown("""
+        <div style="text-align:center; margin-bottom:8px">
+            <div style="width:56px;height:56px;border-radius:14px;background:#3B6D11;
+                        display:inline-flex;align-items:center;justify-content:center;
+                        font-size:28px;margin-bottom:8px">🌿</div>
+            <h2 style="margin:0;color:#3B6D11;font-size:24px">Lumacta</h2>
+            <p style="margin:2px 0 0;color:#888;font-size:12px">
+                Hitung premi asuransi lebih cerdas & mudah
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("#### Masuk ke akunmu")
+
+        email_atau_username = st.text_input(
+            "Email atau username",
+            placeholder="contoh@email.com atau username",
+            key="login_ident",
+        )
+        password = st.text_input(
+            "Kata sandi",
+            type="password",
+            placeholder="Minimal 6 karakter",
+            key="login_pass",
+        )
+
+        if st.button("Masuk sekarang", key="btn_login"):
+            if not email_atau_username or not password:
+                alert_error("Isi email/username dan kata sandi terlebih dahulu.")
+            else:
+                hasil = login_user(email_atau_username, password)
+                if hasil["ok"]:
+                    st.session_state.user = hasil["user"]
                     st.rerun()
                 else:
-                    st.error("❌ Email atau password salah!")
-            st.caption("💡 Belum punya akun? Registrasi dulu ya!")
-    
-    with tab2:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            new_email = st.text_input("Email", placeholder="email@anda.com")
-            new_name = st.text_input("Nama Lengkap")
-            new_pass = st.text_input("Password", type="password")
-            confirm_pass = st.text_input("Konfirmasi Password", type="password")
-            if st.button("📝 Daftar", use_container_width=True):
-                if new_pass != confirm_pass:
-                    st.error("Password tidak cocok!")
-                elif len(new_pass) < 4:
-                    st.error("Password minimal 4 karakter!")
-                elif "@" not in new_email:
-                    st.error("Email tidak valid!")
-                else:
-                    success, msg = register_user(new_email, new_pass, new_name)
-                    st.success(msg) if success else st.error(msg)
-    
-    with tab3:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            forgot_email = st.text_input("Email Anda")
-            new_password = st.text_input("Password Baru", type="password")
-            if st.button("🔄 Reset Password", use_container_width=True):
-                success, msg = reset_password(forgot_email, new_password)
-                st.success(msg) if success else st.error(msg)
-    st.stop()
+                    alert_error(hasil["pesan"])
 
-with st.sidebar:
-    st.markdown("<h2 style='text-align:center'>🌸 Life Nova</h2>", unsafe_allow_html=True)
-    st.markdown(f"👋 Halo, **{st.session_state.user_email}**!")
-    st.markdown("---")
-    
-    menu_options = ["🏠 Dashboard", "💰 Asuransi Jiwa", "📈 Anuitas", "🏦 Dana Pensiun", "ℹ️ Tentang"]
-    
-    if is_admin(st.session_state.user_email):
-        menu_options.append("👥 Data User")
-    
-    menu = st.selectbox("Menu", menu_options)
-    st.markdown("---")
-    if st.button("🚪 Logout", use_container_width=True):
-        st.session_state.logged_in = False
-        st.session_state.user_email = None
-        st.rerun()
+        st.markdown("<div style='text-align:center;margin-top:14px;font-size:13px'>", unsafe_allow_html=True)
+        st.markdown("Belum punya akun?")
+        if st.button("Daftar gratis →", key="ke_register"):
+            st.session_state.halaman_auth = "register"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown(f"""
-<div class="main-header">
-    <h1>🌸 Life Nova</h1>
-    <p>{menu} | {st.session_state.user_email}</p>
-</div>
-""", unsafe_allow_html=True)
 
-if menu == "🏠 Dashboard":
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown(f'<div class="metric-card"><h2>{get_qx(60)*100:.1f}%</h2><p>Prob. Kematian (60th)</p></div>', unsafe_allow_html=True)
-    with col2:
-        st.markdown(f'<div class="metric-card"><h2>{get_npx(30,30)*100:.1f}%</h2><p>Prob. Hidup 30→60th</p></div>', unsafe_allow_html=True)
-    with col3:
-        st.markdown('<div class="metric-card"><h2>8%</h2><p>Return Investasi</p></div>', unsafe_allow_html=True)
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=MORTALITY_TABLE['usia'], y=MORTALITY_TABLE['lx'], 
-                              mode='lines', name='Kurva Survival',
-                              line=dict(color='#FFB7B2', width=3), fill='tozeroy'))
-    fig.update_layout(title="Kurva Survival - Tabel Mortalita", height=450)
-    st.plotly_chart(fig, use_container_width=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# HALAMAN REGISTER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-elif menu == "💰 Asuransi Jiwa":
-    st.subheader("💰 Kalkulator Premi Asuransi")
-    col1, col2 = st.columns(2)
-    with col1:
-        jenis = st.selectbox("Jenis Asuransi", ["Whole Life", "Term Life", "Endowment"])
-        usia = st.number_input("Usia Peserta", 0, 90, 30)
-        bunga = st.number_input("Tingkat Bunga (%)", 0.0, 15.0, 5.0) / 100
-    with col2:
-        benefit = st.number_input("Uang Pertanggungan (Rp)", 1000000, 1000000000, 100000000, step=10000000)
-        if jenis != "Whole Life":
-            jangka = st.number_input("Jangka Waktu (tahun)", 1, 30, 10)
-    if st.button("🌸 Hitung Premi", use_container_width=True):
-        if jenis == "Whole Life":
-            premi = calculate_whole_life(usia, bunga, benefit)
-        elif jenis == "Term Life":
-            premi = calculate_term_life(usia, bunga, jangka, benefit)
-        else:
-            premi = calculate_endowment(usia, bunga, jangka, benefit)
-        st.success(f"### ✨ Premi: **Rp {premi:,.0f}**")
+def halaman_register():
+    col_l, col_c, col_r = st.columns([1, 1.2, 1])
+    with col_c:
+        st.markdown("""
+        <div style="text-align:center; margin-bottom:8px">
+            <div style="width:56px;height:56px;border-radius:14px;background:#3B6D11;
+                        display:inline-flex;align-items:center;justify-content:center;
+                        font-size:28px;margin-bottom:8px">🌿</div>
+            <h2 style="margin:0;color:#3B6D11;font-size:24px">Lumacta</h2>
+            <p style="margin:2px 0 0;color:#888;font-size:12px">
+                Buat akun gratis — tidak perlu kartu kredit
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
 
-elif menu == "📈 Anuitas":
-    st.subheader("📈 Kalkulator Anuitas")
-    col1, col2 = st.columns(2)
-    with col1:
-        jenis = st.selectbox("Jenis Anuitas", ["Berjangka", "Seumur Hidup"])
-        usia = st.number_input("Usia Peserta", 0, 90, 55)
-        bunga = st.number_input("Tingkat Bunga (%)", 0.0, 15.0, 5.0) / 100
-    with col2:
-        if jenis == "Berjangka":
-            jangka = st.number_input("Jangka Waktu (tahun)", 1, 40, 20)
-        pembayaran = st.number_input("Pembayaran per Tahun (Rp)", 1000000, 500000000, 50000000, step=5000000)
-    if st.button("🌸 Hitung Nilai Sekarang", use_container_width=True):
-        is_lifetime = (jenis == "Seumur Hidup")
-        jangka_val = jangka if not is_lifetime else 0
-        nilai = calculate_annuity(usia, bunga, jangka_val, is_lifetime, pembayaran)
-        st.success(f"### ✨ Nilai Sekarang: **Rp {nilai:,.0f}**")
+        st.markdown("---")
+        st.markdown("#### Buat akun baru")
 
-elif menu == "🏦 Dana Pensiun":
-    st.subheader("🏦 Perencanaan Dana Pensiun")
-    col1, col2 = st.columns(2)
-    with col1:
-        usia_skrg = st.number_input("Usia Sekarang", 20, 60, 30)
-        usia_pensiun = st.number_input("Usia Pensiun", usia_skrg+1, 70, 60)
-        gaji = st.number_input("Gaji Bulanan (Rp)", 1000000, 100000000, 10000000, step=1000000)
-    with col2:
-        iuran = st.number_input("Iuran (%)", 1, 30, 5)
-        return_inv = st.number_input("Return Investasi (%)", 1, 20, 8) / 100
-    if st.button("🌸 Hitung Dana Pensiun", use_container_width=True):
-        dana = calculate_pension(usia_skrg, usia_pensiun, gaji, iuran, return_inv)
-        st.metric("💰 Total Dana Terkumpul", f"Rp {dana:,.0f}")
-
-elif menu == "👥 Data User":
-    st.subheader("👥 Data Seluruh User")
-    st.info("🔒 Halaman ini hanya bisa dilihat oleh ADMIN")
-    
-    users = get_all_users()
-    if users:
-        data = []
-        for email, info in users.items():
-            data.append({
-                'Email': email,
-                'Nama': info.get('name', '-'),
-                'Tanggal Daftar': info.get('created_at', '-'),
-                'Terakhir Login': info.get('last_login', '-'),
-                'Status': info.get('status', 'active')
-            })
-        df_users = pd.DataFrame(data)
-        st.dataframe(df_users, use_container_width=True)
-        
-        csv = df_users.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Data User (CSV)",
-            data=csv,
-            file_name=f"users_{datetime.datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
+        nama = st.text_input("Nama lengkap", placeholder="Siti Aminah", key="reg_nama")
+        email = st.text_input("Alamat email", placeholder="contoh@email.com", key="reg_email")
+        username = st.text_input(
+            "Username",
+            placeholder="sitiaminah  (tanpa spasi)",
+            key="reg_username",
         )
-    else:
-        st.info("Belum ada user yang terdaftar")
+        password = st.text_input(
+            "Kata sandi",
+            type="password",
+            placeholder="Minimal 6 karakter",
+            key="reg_pass",
+        )
+        konfirmasi = st.text_input(
+            "Ulangi kata sandi",
+            type="password",
+            placeholder="Sama seperti kata sandi di atas",
+            key="reg_konfirmasi",
+        )
 
+        if st.button("Buat akun sekarang", key="btn_register"):
+            if not all([nama, email, username, password, konfirmasi]):
+                alert_error("Semua kolom wajib diisi.")
+            elif password != konfirmasi:
+                alert_error("Kata sandi dan konfirmasi tidak cocok.")
+            else:
+                hasil = register_user(nama, email, username, password)
+                if hasil["ok"]:
+                    alert_sukses(f"Akun berhasil dibuat! Silakan masuk, {hasil['nama']}.")
+                    st.session_state.halaman_auth = "login"
+                    st.rerun()
+                else:
+                    alert_error(hasil["pesan"])
+
+        st.markdown("<div style='text-align:center;margin-top:14px;font-size:13px'>", unsafe_allow_html=True)
+        st.markdown("Sudah punya akun?")
+        if st.button("← Masuk di sini", key="ke_login"):
+            st.session_state.halaman_auth = "login"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HALAMAN DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def halaman_dashboard():
+    user = st.session_state.user
+    navbar()
+
+    # Welcome banner
+    st.markdown(f"""
+    <div class="welcome-banner">
+        <div>
+            <div class="wb-name">Selamat datang, {user['nama']} 👋</div>
+            <div class="wb-sub">{user['email']} &nbsp;·&nbsp; @{user['username']}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Tombol keluar di atas kanan
+    col_space, col_logout = st.columns([5, 1])
+    with col_logout:
+        if st.button("Keluar", key="btn_logout"):
+            st.session_state.user = None
+            st.session_state.halaman_auth = "login"
+            st.rerun()
+
+    # ── Statistik ringkas ────────────────────────────────────────────────────
+    riwayat = ambil_riwayat(user["id"], limit=50)
+    total   = len(riwayat)
+    premi   = sum(1 for r in riwayat if r["fitur"] == "Simulasi Premi")
+    bandin  = sum(1 for r in riwayat if r["fitur"] == "Bandingkan")
+    peluang = sum(1 for r in riwayat if r["fitur"] == "Peluang Hidup")
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, label, val, delta, warna in [
+        (c1, "Total perhitungan", total,   "Semua fitur",       "delta-green"),
+        (c2, "Simulasi premi",   premi,   "Tabungan berjangka", "delta-pink"),
+        (c3, "Perbandingan",     bandin,  "Fitur unggulan",     "delta-green"),
+        (c4, "Peluang hidup",    peluang, "Analisis survival",  "delta-green"),
+    ]:
+        with col:
+            st.markdown(f"""
+            <div class="stat-card">
+                <div class="label">{label}</div>
+                <div class="value">{val}</div>
+                <div class="{warna}">{delta}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Fitur utama ──────────────────────────────────────────────────────────
+    st.markdown("#### Pilih fitur")
+    fc1, fc2, fc3, fc4 = st.columns(4)
+
+    fitur_list = [
+        (fc1, "fc-icon-p", "🪙", "Simulasi premi tabungan",
+         "Hitung berapa premi sekali bayar untuk dapat uang pertanggungan — baik meninggal maupun hidup sampai akhir kontrak.",
+         "btn_fitur_premi"),
+        (fc2, "fc-icon-g", "⚖️", "Bandingkan dua jenis asuransi",
+         "Lihat perbedaan biaya antara asuransi per tahun vs terus-menerus dalam grafik yang mudah dibaca.",
+         "btn_fitur_bandin"),
+        (fc3, "fc-icon-p", "💓", "Peluang hidup",
+         "Ketahui berapa besar kemungkinan seseorang masih hidup di usia tertentu berdasarkan data mortalitas.",
+         "btn_fitur_peluang"),
+        (fc4, "fc-icon-g", "📋", "Unduh laporan PDF",
+         "Ekspor semua hasil perhitungan menjadi laporan PDF lengkap dengan identitas dan rumus yang digunakan.",
+         "btn_fitur_pdf"),
+    ]
+
+    for col, icon_cls, icon, judul, deskripsi, key in fitur_list:
+        with col:
+            st.markdown(f"""
+            <div class="fitur-card">
+                <div class="fc-icon {icon_cls}">{icon}</div>
+                <h4>{judul}</h4>
+                <p>{deskripsi}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.button("Buka fitur →", key=key)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Riwayat perhitungan ──────────────────────────────────────────────────
+    st.markdown("#### Riwayat perhitungan terakhir")
+
+    riwayat_tampil = ambil_riwayat(user["id"], limit=5)
+
+    if not riwayat_tampil:
+        st.markdown("""
+        <div style="text-align:center;padding:24px;color:#aaa;font-size:13px;
+                    background:#f9f9f9;border-radius:12px">
+            Belum ada perhitungan. Mulai dari salah satu fitur di atas!
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        icon_map = {
+            "Simulasi Premi": ("🪙", "rw-icon-p"),
+            "Bandingkan":     ("⚖️", "rw-icon-g"),
+            "Peluang Hidup":  ("💓", "rw-icon-p"),
+        }
+        for r in riwayat_tampil:
+            ikon, ikon_cls = icon_map.get(r["fitur"], ("📌", "rw-icon-g"))
+            tanggal = r["created_at"][:16].replace("T", "  ")
+            st.markdown(f"""
+            <div class="rw-item">
+                <div class="rw-icon {ikon_cls}">{ikon}</div>
+                <div class="rw-info">
+                    <div class="rw-name">{r['deskripsi']}</div>
+                    <div class="rw-date">{tanggal}</div>
+                </div>
+                <div class="rw-val">{r['hasil']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ── Demo: tombol tambah riwayat contoh ───────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("🧪 Demo — tambah data riwayat contoh"):
+        st.caption("Ini hanya untuk demo. Nanti riwayat otomatis terisi dari hasil perhitungan.")
+        if st.button("Tambah contoh riwayat"):
+            simpan_riwayat(user["id"], "Simulasi Premi",
+                           "Premi tabungan 15 tahun · usia 30 · bunga 6%",
+                           "Rp 39.156.000")
+            simpan_riwayat(user["id"], "Bandingkan",
+                           "Perbandingan asuransi 10 tahun · usia 35",
+                           "Selisih 4.1%")
+            simpan_riwayat(user["id"], "Peluang Hidup",
+                           "Peluang hidup sampai usia 75 · dari usia 40",
+                           "72.3%")
+            st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROUTER UTAMA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.user is None:
+    if st.session_state.halaman_auth == "register":
+        halaman_register()
+    else:
+        halaman_login()
 else:
-    st.markdown("""
-    ### 🌸 Life Nova - Aplikasi Aktuaria
-    
-    **✨ Fitur Lengkap:**
-    - ✅ Login dengan EMAIL
-    - ✅ Registrasi user baru
-    - ✅ Reset password
-    - ✅ Asuransi Whole Life, Term Life, Endowment
-    - ✅ Anuitas Berjangka & Seumur Hidup
-    - ✅ Dana Pensiun
-    - ✅ Kurva Survival
-    
-    **👑 Cara Menjadi Admin:**
-    - Registrasi dengan email: `admin@lifenova.com`
-    - Setelah login, kamu akan melihat menu "Data User"
-    
-    **🔒 Data User:**
-    - Tersimpan di file JSON dalam aplikasi
-    - Hanya admin yang bisa melihat data user
-    """)
+    halaman_dashboard()
